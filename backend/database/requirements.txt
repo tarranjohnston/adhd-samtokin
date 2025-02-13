@@ -26,3 +26,10 @@ tqdm==4.67.1
 typing_extensions==4.12.2
 tzdata==2025.1
 uvicorn==0.34.0
+googletrans==4.0.2
+plotly==6.0.0
+pillow==11.0.0
+dash==2.18.2
+dash-core-components==2.0.0
+dash-html-components==2.0.0
+dash-table==5.0.0

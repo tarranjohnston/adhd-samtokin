@@ -8,6 +8,7 @@ import joblib
 import numpy as np
 import time
 import nltk
+from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score, f1_score
@@ -18,7 +19,9 @@ nltk.download('averaged_perceptron_tagger')
 nltk.download('stopwords')
 
 # Load dataset
-dfTrain = pd.read_csv(".\dataset\charity_emails_v10.csv")
+file_path = Path(__file__).parent / "dataset" / "charity_emails_v10.csv"
+print("Adjusted Path:", file_path)
+dfTrain = pd.read_csv(file_path)
 
 train = np.array(dfTrain)
 features = (train[:, 0].astype(object) + " " + train[:, 2].astype(object))
@@ -33,7 +36,8 @@ def preprocess(features):
     features = [" ".join(lemmatize_text(f)) for f in features]
     vect = TfidfVectorizer(max_features=2000, stop_words="english")
     vectors_train = vect.fit_transform(features)
-    joblib.dump(vect, "tfidf_vectorizer.pkl")
+    vector_path = Path(__file__).parent / "model" / "tfidf_vectorizer.pkl"
+    joblib.dump(vect, vector_path)
     return np.asarray(vectors_train.todense())
 
 def train_and_evaluate(model, X, y):
@@ -91,7 +95,9 @@ comparison_df = None
 for model_name, model in models.items():
     print(f"Training {model_name}...")
     accuracy, runtime, cm, auroc, f1, y_test, y_pred = train_and_evaluate(model, X_processed, labels)
-    joblib.dump(model, f"{model_name}_model.pkl")
+    model_name_path = f"{model_name}_model.pkl"
+    model_path = Path(__file__).parent / "model" / model_name_path
+    joblib.dump(model, model_path)
     comparison_data.append({"Model": model_name, "Accuracy": accuracy, "Training Time (s)": runtime, "AUROC": auroc, "F1 Score": f1})
     confusion_matrices[model_name] = {"cm": cm, "auroc": auroc, "f1": f1, "accuracy": accuracy, "training_time": runtime}
 
