@@ -14,13 +14,14 @@ import nltk
 import joblib
 import time
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import Response
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload
 from sqlalchemy.ext.declarative import declarative_base
-from sklearn.neural_network import MLPClassifier
+from sklearn.svm import SVC
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -38,7 +39,7 @@ nltk.download('stopwords')
 
 lemmatizer = WordNetLemmatizer()
 vectorizer: TfidfVectorizer | None = None
-model: MLPClassifier | None = None
+model: SVC | None = None
 
 def lemmatize_text(text):
     return [lemmatizer.lemmatize(word) for word in text.split()]
@@ -96,7 +97,7 @@ def single_validate(model, X, y, test_size=0.4, random_state=42) -> tuple[int, i
 def train_classifier(emails: list[Email]) -> tuple[int, int, float, float]:
     # Create model
     global model
-    model = MLPClassifier()
+    model = SVC(probability=True)
 
     # Get features and labels
     df = pd.DataFrame.from_records([email.__dict__ for email in emails])
@@ -118,7 +119,7 @@ def predict_category(email: Email) -> int:
 ############### Models ###############
 
 # Define the database URL
-DATABASE_URL = "sqlite:///training_data.db"
+DATABASE_URL = "sqlite:///db.sqlite3"
 
 # Create the database engine
 engine = create_engine(DATABASE_URL)
@@ -133,6 +134,7 @@ class Category(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True)
+    emails = relationship("Email", back_populates="category", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"Category(name='{self.name}')"
@@ -145,7 +147,7 @@ class Email(Base):
     sender = Column(String)
     body = Column(String)
     category_id = Column(Integer, ForeignKey('categories.id'))
-    category = relationship("Category", backref="emails", cascade="all")
+    category = relationship("Category", back_populates="emails")
     is_validated = Column(Boolean, default=False)   # Whether the category for this email has been manually validated
 
     def __repr__(self):
@@ -182,6 +184,10 @@ class EmailResponse(BaseModel):
     category_id: int
     is_validated: bool
 
+class EmailToCsvResponse(BaseModel):
+    number_of_emails: int
+    csv_filename: str
+
 # Schemas for /classifier/
 class EmailClassifierRequest(BaseModel):
     subject: str
@@ -209,7 +215,7 @@ async def lifespan(app: FastAPI):
         model = joblib.load(MODEL_FILENAME)
         print(f"Model loaded from {MODEL_FILENAME}")
     except:
-        model = MLPClassifier()
+        model = SVC()
         print("Model not found. New model created.")
     try:
         vectorizer = joblib.load(VECTORIZER_FILENAME)
@@ -219,6 +225,14 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+
+@app.delete("/", response_class=Response, responses={204: {"description": "Database Clear"}})
+async def clear_database(db: Session = Depends(get_db)) -> Response:
+    """Deletes all emails and categories, effectively clearing the database."""
+    db.query(Email).delete()
+    db.query(Category).delete()
+    db.commit()
+    return Response(status_code=204)
 
 @app.get("/categories/", response_model=list[CategoryResponse])
 async def get_all_categories(db: Session = Depends(get_db)) -> list[CategoryResponse]:
@@ -234,7 +248,6 @@ async def get_category(category_id: int, db: Session = Depends(get_db)) -> Categ
 
 @app.post("/categories/", response_model=list[CategoryResponse])
 async def add_categories(category_names: list[str], db: Session = Depends(get_db)) -> list[CategoryResponse]:
-    # Add multiple categories to database
     new_categories = [Category(name = category_name) for category_name in category_names]
     db.add_all(new_categories)
     db.commit()
@@ -242,10 +255,22 @@ async def add_categories(category_names: list[str], db: Session = Depends(get_db
         db.refresh(category)
     return new_categories
 
+@app.delete("/categories/{category_id}", response_class=Response, responses={204: {"description": "Category Deleted"}})
+async def delete_category(category_id: int, db: Session = Depends(get_db)) -> Response:
+    """Deletes a category from the database, including all emails in that category."""
+    category = db.query(Category).get(category_id)
+    if category is not None:
+        db.delete(category)
+        db.commit()
+    return Response(status_code=204)
+
 @app.get("/emails/", response_model=list[EmailResponse])
 async def get_emails(limit: int = 100, db: Session = Depends(get_db)) -> list[EmailResponse]:
-    emails = db.query(Email).limit(limit).all()
-    return emails
+    """Gets emails (up to a limit) from the database. If `limit <= 0`, returns all emails."""
+    if limit <= 0:
+        return db.query(Email).all()
+    else:
+        return db.query(Email).limit(limit).all()
 
 @app.get("/emails/{email_id}", response_model=EmailResponse)
 async def get_email(email_id: int, db: Session = Depends(get_db)) -> EmailResponse:
@@ -256,7 +281,8 @@ async def get_email(email_id: int, db: Session = Depends(get_db)) -> EmailRespon
 
 @app.post("/emails/", response_model=list[EmailResponse])
 async def add_emails(emails_post: list[EmailRequest], db: Session = Depends(get_db)) -> list[EmailResponse]:
-    """Adds multiple pre-categorized emails to database"""
+    """Adds multiple pre-categorized emails to database. Also adds new categories if they don't exist.
+    Returns the first 5 emails added."""
 
     # Add new categories
     new_categories = {}
@@ -286,9 +312,10 @@ async def add_emails(emails_post: list[EmailRequest], db: Session = Depends(get_
     # Return the first 5 emails added
     return new_emails[:min(5, len(new_emails))]
 
-@app.post("/emails/from-csv/", response_model=list[EmailResponse])
+@app.post("/emails/csv/", response_model=list[EmailResponse])
 async def add_emails_from_csv(filename: str, db: Session = Depends(get_db)) -> list[EmailResponse]:
-    """Adds multiple pre-categorized emails from a CSV file to database"""
+    """Adds multiple pre-categorized emails from a CSV file to database. Also
+    adds new categories if they don't exist. Returns the first 5 emails added."""
 
     # Load CSV file
     try:
@@ -307,15 +334,26 @@ async def add_emails_from_csv(filename: str, db: Session = Depends(get_db)) -> l
 
     # Add new emails
     new_emails = []
-    for _, row in df.iterrows():
-        category = db.query(Category).filter_by(name=row['category']).first()
-        new_email = Email(
-            subject=row['subject'], 
-            sender=row['sender'], 
-            body=row['body'], 
-            category=category,
-            is_validated=True)
-        new_emails.append(new_email)
+    if "is_validated" in df.columns:
+        for _, row in df.iterrows():
+            category = db.query(Category).filter_by(name=row['category']).first()
+            new_email = Email(
+                subject=row['subject'], 
+                sender=row['sender'], 
+                body=row['body'], 
+                category=category,
+                is_validated=bool(row['is_validated']))
+            new_emails.append(new_email)
+    else:
+        for _, row in df.iterrows():
+            category = db.query(Category).filter_by(name=row['category']).first()
+            new_email = Email(
+                subject=row['subject'], 
+                sender=row['sender'], 
+                body=row['body'], 
+                category=category,
+                is_validated=True)
+            new_emails.append(new_email)
     db.add_all(new_emails)
     db.commit()
     for email in new_emails:
@@ -323,6 +361,32 @@ async def add_emails_from_csv(filename: str, db: Session = Depends(get_db)) -> l
 
     # Return the first 5 emails added
     return new_emails[:min(5, len(new_emails))]
+
+@app.get("/emails/csv/", response_model=EmailToCsvResponse)
+async def export_emails_to_csv(filename: str = "emails.csv", db: Session = Depends(get_db)) -> EmailToCsvResponse:
+    """Exports all emails in the database to a CSV file"""
+
+    emails = db.query(Email).options(joinedload(Email.category)).all()
+    records = []
+    for email in emails:
+        record = email.__dict__
+        record["category"] = email.category.name
+        records.append(record)
+    df = pd.DataFrame.from_records(records)
+    df = df[["subject", "sender", "body", "category", "is_validated"]] # select columns to export
+    try:
+        df.to_csv(filename, index=False)
+    except FileNotFoundError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return EmailToCsvResponse(number_of_emails=len(emails), csv_filename=filename)
+
+@app.delete("/emails/{email_id}", response_class=Response, responses={204: {"description": "Email Deleted"}})
+async def delete_email(email_id: int, db: Session = Depends(get_db)) -> Response:
+    email = db.query(Email).get(email_id)
+    if email is not None:
+        db.delete(email)
+        db.commit()
+    return Response(status_code=204)
 
 @app.post("/classifier/", response_model=EmailClassifierResponse)
 async def categorize_email(email_post: EmailClassifierRequest, db: Session = Depends(get_db)) -> EmailClassifierResponse:
